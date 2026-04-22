@@ -21,13 +21,23 @@ def create_quantization_config_json(
 
     # Create tensor map
     storage_dict = {}
+    tensor_map = config.stc.tensor_file_map
     for module in model:
         # Only list leaf nodes
         if len(module.modules) > 0:
             continue
 
         module_dict = {}
-        stored_tensors = config.stc.list_tensors(module.key, only_serializable = True)
+        stored_tensors = {}
+        prefix = module.key + "."
+        for key in tensor_map.keys():
+            if key == module.key or key.startswith(prefix):
+                meta = config.stc.get_tensor_meta(key, optional = False)[key]
+                stored_tensors[key] = {
+                    "shape": meta["shape"],
+                    "n_bytes": meta["n_bytes"],
+                    "dtype": str(meta["dtype"]),
+                }
         module_dict["stored_tensors"] = stored_tensors
 
         qformat = module.quant_format_id()

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .filter import Filter
 from ...tokenizer import Tokenizer
 import torch

@@ -207,6 +207,8 @@ class Attention(Module):
         interleaved_gate: bool = False,
         ve_gate: bool = False,
         use_k_as_v: bool = False,
+        shared_kv_layer_idx: int | None = None,
+        store_shared_kv: bool = False,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         tp_split_norm: bool = True,
@@ -234,6 +236,8 @@ class Attention(Module):
         self.post_rope_norm = post_rope_norm
         self.tp_split_norm = tp_split_norm
         self.use_k_as_v = use_k_as_v
+        self.shared_kv_layer_idx = shared_kv_layer_idx
+        self.store_shared_kv = store_shared_kv
 
         # Use fallback when head_dim exceeds 256 (max supported by flash-attn
         self.use_bighead_fallback = self.head_dim > 256 or self.use_k_as_v
@@ -504,6 +508,17 @@ class Attention(Module):
         else:
             g = None
 
+        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+
+        if self.shared_kv_layer_idx is not None:
+            shared_kv = params.get(f"_shared_kv.{self.shared_kv_layer_idx}")
+            if shared_kv is not None:
+                k, v = shared_kv
+                if k.device != q.device:
+                    k = k.to(q.device, non_blocking = True)
+                    v = v.to(q.device, non_blocking = True)
+                return q, k, v, g
+
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
@@ -532,7 +547,6 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
-        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
@@ -624,6 +638,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v, g = self.project_qkv(x, params)
+        shared_kv = self.shared_kv_layer_idx is not None and f"_shared_kv.{self.shared_kv_layer_idx}" in params
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -636,7 +651,12 @@ class Attention(Module):
             "Torch SDPA does not support logit softcapping"
 
         if self.q_norm:
-            if self.tp_span_heads_norm:
+            if shared_kv:
+                if isinstance(self.q_norm, RMSNorm):
+                    q = self.q_norm.forward_torch(q, params, out_dtype = torch.half)
+                else:
+                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            elif self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
                 q, k = self.apply_qk_norms_tp(q, k, params)
             elif not self.rope or self.q_norm_tensor is None:
@@ -644,19 +664,37 @@ class Attention(Module):
                 k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(
-                q, k,
-                position,
-                positions,
-                position_ids,
-                True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
-                self.norm_eps,
-                self.norm_constant_bias,
-                inv_freq,
-                self.post_rope_norm
-            )
+            if shared_kv:
+                q, _ = self.rope.apply(
+                    q, None,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    None,
+                    None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+            else:
+                q, k = self.rope.apply(
+                    q, k,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+
+        if self.store_shared_kv:
+            params[f"_shared_kv.{self.layer_idx}"] = (k, v)
 
         if self.use_bighead_fallback and has_xformers:
             _, _, nheads, headdim = q.shape
@@ -714,6 +752,7 @@ class Attention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v, g = self.project_qkv(x, params)
+        shared_kv = self.shared_kv_layer_idx is not None and f"_shared_kv.{self.shared_kv_layer_idx}" in params
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -721,7 +760,12 @@ class Attention(Module):
             v.add_(v_addend)
 
         if self.q_norm:
-            if self.tp_span_heads_norm:
+            if shared_kv:
+                if isinstance(self.q_norm, RMSNorm):
+                    q = self.q_norm.forward_torch(q, params, out_dtype = torch.half)
+                else:
+                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            elif self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
                 q, k = self.apply_qk_norms_tp(q, k, params)
             elif not self.rope or self.q_norm_tensor is None:
@@ -729,19 +773,37 @@ class Attention(Module):
                 k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(
-                q, k,
-                position,
-                positions,
-                position_ids,
-                True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
-                self.norm_eps,
-                self.norm_constant_bias,
-                inv_freq,
-                self.post_rope_norm
-            )
+            if shared_kv:
+                q, _ = self.rope.apply(
+                    q, None,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    None,
+                    None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+            else:
+                q, k = self.rope.apply(
+                    q, k,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+
+        if self.store_shared_kv:
+            params[f"_shared_kv.{self.layer_idx}"] = (k, v)
 
         if self.use_cu_seqlens and (cu_seqlens := get_for_device(params, "cu_seqlens", self.device, None)) is not None:
             max_seqlen = params["max_seqlen"]
@@ -795,6 +857,7 @@ class Attention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         q, k, v, g = self.project_qkv(x, params)
+        shared_kv = self.shared_kv_layer_idx is not None and f"_shared_kv.{self.shared_kv_layer_idx}" in params
 
         # Optional addend to V tensor (e.g. value embeddings)
         if self.ve_gate:
@@ -803,7 +866,12 @@ class Attention(Module):
 
         # TODO: Add LayerNorm option to fused norm/RoPE kernel
         if self.q_norm:
-            if self.tp_span_heads_norm:
+            if shared_kv:
+                if isinstance(self.q_norm, RMSNorm):
+                    q = self.q_norm.forward_torch(q, params, out_dtype = torch.half)
+                else:
+                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            elif self.tp_span_heads_norm:
                 # TP-aware path for span_heads=True
                 q, k = self.apply_qk_norms_tp(q, k, params)
             elif not self.rope or self.q_norm_tensor is None:
@@ -811,19 +879,37 @@ class Attention(Module):
                 k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(
-                q, k,
-                position,
-                positions,
-                position_ids,
-                True,
-                self.q_norm_tensor if not self.tp_span_heads_norm else None,
-                self.k_norm_tensor if not self.tp_span_heads_norm else None,
-                self.norm_eps,
-                self.norm_constant_bias,
-                inv_freq,
-                self.post_rope_norm
-            )
+            if shared_kv:
+                q, _ = self.rope.apply(
+                    q, None,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    None,
+                    None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+            else:
+                q, k = self.rope.apply(
+                    q, k,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+
+        if self.store_shared_kv:
+            params[f"_shared_kv.{self.layer_idx}"] = (k, v)
 
         if self.has_split_cache:
             cache_k, cache_v = self.tp_cache_lookup[cache].get_kv(cache_seqlens, block_table, self.sliding_window)

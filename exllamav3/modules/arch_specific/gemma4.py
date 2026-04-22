@@ -324,8 +324,9 @@ class Gemma4PerLayerInputProjector(Module):
         params: dict,
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        per_layer_tokens = params.pop("_gemma4_per_layer_token_inputs")
-        per_layer_tokens = per_layer_tokens.to(self.device, non_blocking = True)
+        per_layer_tokens = params.pop("_gemma4_per_layer_token_inputs", None)
+        if per_layer_tokens is not None:
+            per_layer_tokens = per_layer_tokens.to(self.device, non_blocking = True)
 
         proj = self.proj.forward(x.half(), params, out_dtype = self.out_dtype)
         proj *= self.per_layer_model_projection_scale
@@ -335,7 +336,10 @@ class Gemma4PerLayerInputProjector(Module):
             self.hidden_size_per_layer_input,
         )
         proj = self.norm.forward(proj, params, out_dtype = self.out_dtype)
-        per_layer_inputs = (proj + per_layer_tokens) * self.per_layer_input_scale
+        if per_layer_tokens is not None:
+            per_layer_inputs = (proj + per_layer_tokens) * self.per_layer_input_scale
+        else:
+            per_layer_inputs = proj
 
         for idx in range(self.num_hidden_layers):
             params[f"_gemma4_per_layer_input.{idx}"] = per_layer_inputs[:, :, idx, :]
@@ -353,6 +357,7 @@ class Gemma4PerLayerInput(Module):
         hidden_size: int,
         hidden_size_per_layer_input: int,
         rms_norm_eps: float,
+        key_layer_scalar: str | None = None,
         out_dtype: torch.dtype = torch.float,
         gate_qmap: str | None = None,
         proj_qmap: str | None = None,
@@ -361,6 +366,9 @@ class Gemma4PerLayerInput(Module):
         self.module_name = "Gemma4PerLayerInput"
         self.layer_idx = layer_idx
         self.param_key = f"_gemma4_per_layer_input.{layer_idx}"
+        self.key_layer_scalar = key_layer_scalar
+        self.layer_scalar_t = None
+        self.layer_scalar_f = None
         self.out_dtype = out_dtype
 
         self.gate = Linear(
@@ -397,6 +405,40 @@ class Gemma4PerLayerInput(Module):
 
 
     @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        if self.key_layer_scalar:
+            self.layer_scalar_t = self.config.stc.get_tensor(
+                self.key + "." + self.key_layer_scalar,
+                None,
+                allow_bf16 = True,
+                no_defer = True,
+            )
+            assert self.layer_scalar_t.numel() == 1
+            self.layer_scalar_f = self.layer_scalar_t.float().item()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.layer_scalar_t = None
+        self.layer_scalar_f = None
+
+
+    @override
+    def get_tensors(self):
+        tensors = {}
+        if self.key_layer_scalar is not None:
+            tensors[self.key + "." + self.key_layer_scalar] = self.layer_scalar_t.data.contiguous()
+        return tensors
+
+
+    @override
+    def weights_numel(self):
+        return super().weights_numel() + (1 if self.key_layer_scalar is not None else 0)
+
+
+    @override
     def forward(
         self,
         x: torch.Tensor,
@@ -404,14 +446,181 @@ class Gemma4PerLayerInput(Module):
         out_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         residual = x
-        per_layer_input = params[self.param_key]
-        if per_layer_input.device != self.device:
-            per_layer_input = per_layer_input.to(self.device, non_blocking = True)
+        per_layer_input = params.get(self.param_key)
+        if per_layer_input is not None:
+            if per_layer_input.device != self.device:
+                per_layer_input = per_layer_input.to(self.device, non_blocking = True)
 
-        y = self.gate.forward(x.half(), params, out_dtype = self.out_dtype)
-        y = F.gelu(y, approximate = "tanh")
-        y *= per_layer_input
-        y = self.proj.forward(y.half(), params, out_dtype = self.out_dtype)
-        y = self.norm.forward(y, params, out_dtype = self.out_dtype)
-        x = residual + y
+            y = self.gate.forward(x.half(), params, out_dtype = self.out_dtype)
+            y = F.gelu(y, approximate = "tanh")
+            y *= per_layer_input
+            y = self.proj.forward(y.half(), params, out_dtype = self.out_dtype)
+            y = self.norm.forward(y, params, out_dtype = self.out_dtype)
+            x = residual + y
+        if self.layer_scalar_f is not None:
+            x *= self.layer_scalar_f
+        return to2(x, out_dtype, self.out_dtype)
+
+
+class Gemma4DecoderLayer(Module):
+
+    def __init__(
+        self,
+        config: Config,
+        key: str,
+        layer_idx: int,
+        hidden_size: int,
+        attn_norm: Module,
+        attn: Module,
+        attn_post_norm: Module,
+        mlp_norm: Module,
+        mlp: Module,
+        mlp_post_norm: Module,
+        hidden_size_per_layer_input: int = 0,
+        rms_norm_eps: float | None = None,
+        key_layer_scalar: str | None = None,
+        out_dtype: torch.dtype = torch.float,
+        gate_qmap: str | None = None,
+        proj_qmap: str | None = None,
+    ):
+        super().__init__(config, key, None)
+        self.layer_idx = layer_idx
+        self.attn_norm = attn_norm
+        self.attn = attn
+        self.attn_post_norm = attn_post_norm
+        self.mlp_norm = mlp_norm
+        self.mlp = mlp
+        self.mlp_post_norm = mlp_post_norm
+        self.key_layer_scalar = key_layer_scalar
+        self.layer_scalar_t = None
+        self.layer_scalar_f = None
+        self.out_dtype = out_dtype
+
+        self.hidden_size_per_layer_input = hidden_size_per_layer_input
+        self.param_key = f"_gemma4_per_layer_input.{layer_idx}" if hidden_size_per_layer_input else None
+
+        self.ple_gate = None
+        self.ple_proj = None
+        self.ple_norm = None
+        if hidden_size_per_layer_input:
+            assert rms_norm_eps is not None, "Gemma4DecoderLayer requires rms_norm_eps when PLE is enabled"
+            self.ple_gate = Linear(
+                config = config,
+                key = f"{key}.per_layer_input_gate",
+                in_features = hidden_size,
+                out_features = hidden_size_per_layer_input,
+                qmap = gate_qmap,
+                out_dtype = out_dtype,
+            )
+            self.ple_proj = Linear(
+                config = config,
+                key = f"{key}.per_layer_projection",
+                in_features = hidden_size_per_layer_input,
+                out_features = hidden_size,
+                qmap = proj_qmap,
+                out_dtype = out_dtype,
+            )
+            self.ple_norm = RMSNorm(
+                config = config,
+                key = f"{key}.post_per_layer_input_norm",
+                rms_norm_eps = rms_norm_eps,
+                out_dtype = out_dtype,
+            )
+
+        self.register_submodule(self.attn_norm)
+        self.register_submodule(self.attn)
+        self.register_submodule(self.attn_post_norm)
+        self.register_submodule(self.mlp_norm)
+        self.register_submodule(self.mlp)
+        self.register_submodule(self.mlp_post_norm)
+        self.register_submodule(self.ple_gate)
+        self.register_submodule(self.ple_proj)
+        self.register_submodule(self.ple_norm)
+
+        self.num_slices = mlp.num_slices if mlp else 1
+
+
+    @override
+    def optimizer_targets(self):
+        a = self.attn.optimizer_targets() if self.attn else []
+        m = self.mlp.optimizer_targets() if self.mlp else []
+        p = []
+        if self.ple_gate is not None:
+            p = [self.ple_gate.optimizer_targets(), self.ple_proj.optimizer_targets()]
+        return [a, m, p]
+
+
+    @override
+    def load(self, device: torch.device, **kwargs):
+        super().load(device, **kwargs)
+        if self.key_layer_scalar:
+            self.layer_scalar_t = self.config.stc.get_tensor(
+                self.key + "." + self.key_layer_scalar,
+                None,
+                allow_bf16 = True,
+                no_defer = True,
+            )
+            assert self.layer_scalar_t.numel() == 1
+            self.layer_scalar_f = self.layer_scalar_t.float().item()
+
+
+    @override
+    def unload(self):
+        super().unload()
+        self.layer_scalar_t = None
+        self.layer_scalar_f = None
+
+
+    @override
+    def get_tensors(self):
+        tensors = {}
+        if self.key_layer_scalar is not None:
+            tensors[self.key + "." + self.key_layer_scalar] = self.layer_scalar_t.data.contiguous()
+        return tensors
+
+
+    @override
+    def weights_numel(self):
+        return super().weights_numel() + (1 if self.key_layer_scalar is not None else 0)
+
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if self.attn:
+            y = self.attn_norm.forward(x, params, out_dtype = torch.half) if self.attn_norm else x.half()
+            y = self.attn.forward(y, params)
+            if self.attn_post_norm:
+                y = self.attn_post_norm.forward(y, params)
+            x += y
+
+        if self.mlp:
+            residual = x
+            params["residual"] = x
+            y = self.mlp_norm.forward(x, params, out_dtype = torch.half) if self.mlp_norm else x.half()
+            y = self.mlp.forward(y, params)
+            if self.mlp_post_norm:
+                y = self.mlp_post_norm.forward(y, params)
+            x = residual + y
+
+        if self.ple_gate is not None:
+            residual = x
+            per_layer_input = params.get(self.param_key)
+            if per_layer_input is not None:
+                if per_layer_input.device != self.device:
+                    per_layer_input = per_layer_input.to(self.device, non_blocking = True)
+                y = self.ple_gate.forward(x.half(), params, out_dtype = self.out_dtype)
+                y = F.gelu(y, approximate = "tanh")
+                y *= per_layer_input
+                y = self.ple_proj.forward(y.half(), params, out_dtype = self.out_dtype)
+                y = self.ple_norm.forward(y, params, out_dtype = self.out_dtype)
+                x = residual + y
+
+        if self.layer_scalar_f is not None:
+            x *= self.layer_scalar_f
+
         return to2(x, out_dtype, self.out_dtype)

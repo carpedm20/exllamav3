@@ -164,6 +164,8 @@ class SlidingAttention(Module):
         v_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
+        shared_kv_layer_idx: int | None = None,
+        store_shared_kv: bool = False,
         post_rope_norm: bool = False,
         select_hq_bits: int = 0,
     ):
@@ -186,6 +188,8 @@ class SlidingAttention(Module):
         self.kv_state_size = sliding_window + sliding_window_overp
         self.logit_softcapping = logit_softcapping
         self.post_rope_norm = post_rope_norm
+        self.shared_kv_layer_idx = shared_kv_layer_idx
+        self.store_shared_kv = store_shared_kv
         self.stage_k = None
         self.stage_v = None
 
@@ -430,6 +434,17 @@ class SlidingAttention(Module):
         else:
             g = None
 
+        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
+
+        if self.shared_kv_layer_idx is not None:
+            shared_kv = params.get(f"_shared_kv.{self.shared_kv_layer_idx}")
+            if shared_kv is not None:
+                k, v = shared_kv
+                if k.device != q.device:
+                    k = k.to(q.device, non_blocking = True)
+                    v = v.to(q.device, non_blocking = True)
+                return q, k, v, g
+
         if self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params)
@@ -458,7 +473,6 @@ class SlidingAttention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
-        q = q.view(bsz, q_len, self.num_q_heads, self.head_dim)
         k = k.view(bsz, q_len, self.num_kv_heads, self.head_dim)
         v = v.view(bsz, q_len, self.num_kv_heads, self.head_dim)
 
@@ -488,26 +502,50 @@ class SlidingAttention(Module):
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
 
         q, k, v, g = self.project_qkv(x, params)
+        shared_kv = self.shared_kv_layer_idx is not None and f"_shared_kv.{self.shared_kv_layer_idx}" in params
 
         if self.q_norm:
-            if not self.rope or self.q_norm_tensor is None:
+            if shared_kv:
+                if isinstance(self.q_norm, RMSNorm):
+                    q = self.q_norm.forward_torch(q, params, out_dtype = torch.half)
+                else:
+                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            elif not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
                 k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(
-                q, k,
-                position,
-                positions,
-                position_ids,
-                True,
-                self.q_norm_tensor,
-                self.k_norm_tensor,
-                self.norm_eps,
-                self.norm_constant_bias,
-                inv_freq,
-                self.post_rope_norm
-            )
+            if shared_kv:
+                q, _ = self.rope.apply(
+                    q, None,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    None,
+                    None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+            else:
+                q, k = self.rope.apply(
+                    q, k,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    self.q_norm_tensor,
+                    self.k_norm_tensor,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+
+        if self.store_shared_kv:
+            params[f"_shared_kv.{self.layer_idx}"] = (k, v)
 
         o = flash_attn_func(
             q = q,
@@ -540,26 +578,50 @@ class SlidingAttention(Module):
         non_causal_spans = params.get("non_causal_spans")
 
         q, k, v, g = self.project_qkv(x, params)
+        shared_kv = self.shared_kv_layer_idx is not None and f"_shared_kv.{self.shared_kv_layer_idx}" in params
 
         if self.q_norm:
-            if not self.rope or self.q_norm_tensor is None:
+            if shared_kv:
+                if isinstance(self.q_norm, RMSNorm):
+                    q = self.q_norm.forward_torch(q, params, out_dtype = torch.half)
+                else:
+                    q = self.q_norm.forward(q, params, out_dtype = torch.half)
+            elif not self.rope or self.q_norm_tensor is None:
                 q = self.q_norm.forward(q, params, out_dtype = torch.half)
                 k = self.k_norm.forward(k, params, out_dtype = torch.half)
 
         if self.rope:
-            q, k = self.rope.apply(
-                q, k,
-                position,
-                positions,
-                position_ids,
-                True,
-                self.q_norm_tensor,
-                self.k_norm_tensor,
-                self.norm_eps,
-                self.norm_constant_bias,
-                inv_freq,
-                self.post_rope_norm
-            )
+            if shared_kv:
+                q, _ = self.rope.apply(
+                    q, None,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    None,
+                    None,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+            else:
+                q, k = self.rope.apply(
+                    q, k,
+                    position,
+                    positions,
+                    position_ids,
+                    True,
+                    self.q_norm_tensor,
+                    self.k_norm_tensor,
+                    self.norm_eps,
+                    self.norm_constant_bias,
+                    inv_freq,
+                    self.post_rope_norm
+                )
+
+        if self.store_shared_kv:
+            params[f"_shared_kv.{self.layer_idx}"] = (k, v)
 
         # Get or initialize recurrent state, may be list of tensors if some batch items haven't filled the window yet
         # TODO: Currently, batch is a list of split caches processed at bsz 1, since caches are large and constructing

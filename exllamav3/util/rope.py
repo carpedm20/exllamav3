@@ -406,7 +406,8 @@ class RoPE:
 
         if len(q.shape) == 3:
             q = q.unsqueeze(0)
-            k = k.unsqueeze(0)
+            if k is not None:
+                k = k.unsqueeze(0)
             squeeze = True
         else:
             squeeze = False

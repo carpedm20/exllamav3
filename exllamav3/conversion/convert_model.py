@@ -109,6 +109,11 @@ def save_tensor(tensor, filename: str, args):
         }, path)
 
 
+def module_qtensor_filename(module_idx: int, module_key: str) -> str:
+    safe_key = module_key.replace(os.sep, "__")
+    return f"qtensors/{module_idx:05d}-{safe_key}.safetensors"
+
+
 def prepare_env(args):
     qtensors_dir = os.path.join(args["work_dir"], "qtensors")
     ckpt_dir = os.path.join(args["work_dir"], "ckpt")
@@ -584,7 +589,7 @@ def main(args, job_state):
             config.stc.close()
 
         # Save layer tensors to working directory
-        save_tensor(q_tensors, f"qtensors/{module.key}.safetensors", args)
+        save_tensor(q_tensors, module_qtensor_filename(idx, module.key), args)
 
         # Output final bpw for layer
         num_bytes = dsize(q_tensors)

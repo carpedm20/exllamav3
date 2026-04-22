@@ -1,7 +1,8 @@
 import os
 import shutil
 import json
-from ..loader.safetensors import SafetensorsCollection
+from safetensors.torch import load_file as load_safetensors_file
+from ..loader.safetensors import SafetensorsCollection, read_header
 from ..version import __version__
 from ..loader.safetensors_alt import save_file
 from ..util.memory import free_mem
@@ -16,6 +17,28 @@ def dsize(d):
     for _, v in d.items(): size += tsize(v)
     return size
 
+
+def module_qtensor_path(work_dir: str, module_idx: int, module_key: str) -> str:
+    safe_key = module_key.replace(os.sep, "__")
+    return os.path.join(work_dir, f"qtensors/{module_idx:05d}-{safe_key}.safetensors")
+
+
+def module_qtensor_sizes(path: str) -> list[int]:
+    if not os.path.exists(path):
+        return []
+    header = read_header(path)
+    sizes = []
+    for key, value in header.items():
+        if key in ["__metadata__", "_header_offset"]:
+            continue
+        beg, end = value["data_offsets"]
+        sizes.append(end - beg)
+    return sizes
+
+
+def load_module_qtensors(path: str) -> dict:
+    return {key: value.contiguous() for key, value in load_safetensors_file(path).items()}
+
 def compile_model(args, model, config, tokenizer):
 
     in_dir = args["in_dir"]
@@ -24,8 +47,7 @@ def compile_model(args, model, config, tokenizer):
         qtensors_stc = config.stc
     else:
         work_dir = args["work_dir"]
-        qtensors_dir = os.path.join(work_dir, "qtensors")
-        qtensors_stc = SafetensorsCollection(qtensors_dir)
+        qtensors_stc = None
 
     # Prepare output directory
     if not os.path.exists(out_dir):
@@ -42,9 +64,11 @@ def compile_model(args, model, config, tokenizer):
     out_map = []
     out_map.append([])
     current_shard_size = 0
-    for module in model.modules:
-        prefix = module.key
-        sizes = qtensors_stc.get_tensor_sizes(prefix)
+    for module_idx, module in enumerate(model.modules):
+        if qtensors_stc is not None:
+            sizes = qtensors_stc.get_tensor_sizes(module.key)
+        else:
+            sizes = module_qtensor_sizes(module_qtensor_path(work_dir, module_idx, module.key))
         if len(sizes) == 0:
             continue
         size = sum(sizes)
@@ -55,7 +79,7 @@ def compile_model(args, model, config, tokenizer):
             out_map.append([])
         current_shard_size += size
         total_size += size
-        out_map[-1].append(module)
+        out_map[-1].append(module if qtensors_stc is not None else (module_idx, module))
 
     # Additional tensors
     extra_tensors = {}
@@ -83,7 +107,10 @@ def compile_model(args, model, config, tokenizer):
         print(f" -- Writing {filename}")
         file_dict = {}
         for m in modules:
-            if isinstance(m, Module):
+            if isinstance(m, tuple):
+                module_idx, module = m
+                tensors = load_module_qtensors(module_qtensor_path(work_dir, module_idx, module.key))
+            elif isinstance(m, Module):
                 prefix = m.key
                 tensors = qtensors_stc.get_tensors(prefix, allow_bf16 = True)
                 tensors = {k: v.contiguous() for k, v in tensors.items()}

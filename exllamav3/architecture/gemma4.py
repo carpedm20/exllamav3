@@ -19,7 +19,7 @@ from ..modules import (
     BlockSparseMLP,
 )
 from ..modules.arch_specific.gemma4 import (
-    Gemma4PerLayerInput,
+    Gemma4DecoderLayer,
     Gemma4PerLayerInputProjector,
     Gemma4TextInputEmbedding,
     Gemma4VisionPatchEmbedder,
@@ -91,6 +91,8 @@ class Gemma4Config(Config):
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
         self.hidden_size_per_layer_input = self.read_cfg(int, "text_config->hidden_size_per_layer_input", 0)
+        self.num_kv_shared_layers = self.read_cfg(int, "text_config->num_kv_shared_layers", 0)
+        self.use_double_wide_mlp = self.read_cfg(bool, "text_config->use_double_wide_mlp", False)
         self.vocab_size_per_layer_input = self.read_cfg(
             int,
             "text_config->vocab_size_per_layer_input",
@@ -175,6 +177,19 @@ class Gemma4Config(Config):
 class Gemma4TextModel(Model):
     config_class = Gemma4Config
 
+    @staticmethod
+    @override
+    def get_additional_compiled_tensors(config: Gemma4Config) -> dict:
+        tensor_map = config.stc.tensor_file_map
+        return {
+            key: {
+                "filename": tensor_map[key],
+                "n_bytes": config.stc.get_tensor_size(key),
+            }
+            for key in tensor_map.keys()
+            if key.startswith("model.language_model.layers.") and key.endswith(".layer_scalar")
+        }
+
     def __init__(
         self,
         config: Gemma4Config,
@@ -226,8 +241,28 @@ class Gemma4TextModel(Model):
 
         self.first_block_idx = len(self.modules)
 
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        last_nonshared_layer_by_type = {}
+        if first_kv_shared_layer_idx > 0:
+            for layer_idx, layer_type in enumerate(config.layer_types[:first_kv_shared_layer_idx]):
+                last_nonshared_layer_by_type[layer_type] = layer_idx
+
         for idx in range(config.num_hidden_layers):
             layer_is_full = config.layer_types[idx] == "full_attention"
+            is_kv_shared_layer = idx >= first_kv_shared_layer_idx > 0
+            kv_shared_layer_idx = (
+                last_nonshared_layer_by_type[config.layer_types[idx]]
+                if is_kv_shared_layer
+                else None
+            )
+            store_shared_kv = (
+                first_kv_shared_layer_idx > 0 and
+                idx < first_kv_shared_layer_idx and
+                last_nonshared_layer_by_type[config.layer_types[idx]] == idx
+            )
+            mlp_intermediate_size = config.intermediate_size * (
+                2 if config.use_double_wide_mlp and is_kv_shared_layer else 1
+            )
 
             if swa_full or config.swa_pattern[idx] <= 0:
                 attn = Attention(
@@ -248,6 +283,8 @@ class Gemma4TextModel(Model):
                     key_o = "o_proj",
                     qmap = "block.attn",
                     sm_scale = 1.0,
+                    shared_kv_layer_idx = kv_shared_layer_idx,
+                    store_shared_kv = store_shared_kv,
                     q_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
@@ -284,6 +321,8 @@ class Gemma4TextModel(Model):
                     key_o = "o_proj",
                     qmap = "block.attn",
                     sm_scale = 1.0,
+                    shared_kv_layer_idx = kv_shared_layer_idx,
+                    store_shared_kv = store_shared_kv,
                     q_norm = RMSNorm(
                         config = config,
                         key = f"{key_prefix}.layers.{idx}.self_attn.q_norm",
@@ -307,13 +346,17 @@ class Gemma4TextModel(Model):
                 config = config,
                 key = f"{key_prefix}.layers.{idx}.mlp",
                 hidden_size = config.hidden_size,
-                intermediate_size = config.intermediate_size,
+                intermediate_size = mlp_intermediate_size,
                 key_up = "up_proj",
                 key_gate = "gate_proj",
                 key_down = "down_proj",
                 qmap = "block.mlp",
                 activation_fn = "gelu",
-                interm_dtype = torch.half,
+                # Gemma 4 small dense layers can drive gate/up activations high enough
+                # for the FP16 gelu_mul path to overflow. Keep gate/up outputs in float
+                # so the activation kernel takes the float-input path and clamps before
+                # converting back to half for the down projection.
+                interm_dtype = torch.float,
                 out_dtype = torch.float,
                 select_hq_bits = 1 if use_moe else 0,
             )
@@ -369,10 +412,11 @@ class Gemma4TextModel(Model):
                     qmap = "block.moe",  # Not same H as mlp, due to routed_pre_norm
                 )
 
-            block = TransformerBlock(
+            block = Gemma4DecoderLayer(
                 config = config,
                 key = f"{key_prefix}.layers.{idx}",
                 layer_idx = idx,
+                hidden_size = config.hidden_size,
                 key_layer_scalar = "layer_scalar",
                 attn_norm = RMSNorm(
                     config = config,
@@ -398,23 +442,14 @@ class Gemma4TextModel(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     out_dtype = torch.float,
                 ),
+                hidden_size_per_layer_input = config.hidden_size_per_layer_input,
+                rms_norm_eps = config.rms_norm_eps if config.hidden_size_per_layer_input else None,
+                out_dtype = torch.float,
+                gate_qmap = None,
+                proj_qmap = None,
             )
 
             self.modules.append(block)
-            if config.hidden_size_per_layer_input:
-                self.modules.append(
-                    Gemma4PerLayerInput(
-                        config = config,
-                        key = f"{key_prefix}.layers.{idx}",
-                        layer_idx = idx,
-                        hidden_size = config.hidden_size,
-                        hidden_size_per_layer_input = config.hidden_size_per_layer_input,
-                        rms_norm_eps = config.rms_norm_eps,
-                        out_dtype = torch.float,
-                        gate_qmap = f"block.ple_gate.{idx}",
-                        proj_qmap = f"block.ple_proj.{idx}",
-                    )
-                )
 
         self.last_kv_module_idx = len(self.modules) - 1
 
@@ -498,9 +533,24 @@ class Gemma4VisionModel(Model):
     @staticmethod
     @override
     def get_additional_compiled_tensors(config: Gemma4Config) -> dict:
+        tensor_map = config.stc.tensor_file_map
         return (
-            config.stc.list_tensors(prefix = "model.vision_tower") |
-            config.stc.list_tensors(prefix = "model.embed_vision")
+            {
+                key: {
+                    "filename": tensor_map[key],
+                    "n_bytes": config.stc.get_tensor_size(key),
+                }
+                for key in tensor_map.keys()
+                if key.startswith("model.vision_tower.")
+            } |
+            {
+                key: {
+                    "filename": tensor_map[key],
+                    "n_bytes": config.stc.get_tensor_size(key),
+                }
+                for key in tensor_map.keys()
+                if key.startswith("model.embed_vision.")
+            }
         )
 
     def __init__(
@@ -616,7 +666,6 @@ class Gemma4VisionModel(Model):
                 config = config,
                 key = "model.embed_vision.embedding_norm",
                 rms_norm_eps = config.rms_norm_eps,
-                constant_bias = 1.0,
                 out_dtype = torch.half,
                 unweighted = True,
             ),
