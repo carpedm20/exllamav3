@@ -19,6 +19,9 @@ from ..modules import (
     BlockSparseMLP,
 )
 from ..modules.arch_specific.gemma4 import (
+    Gemma4PerLayerInput,
+    Gemma4PerLayerInputProjector,
+    Gemma4TextInputEmbedding,
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
 )
@@ -88,8 +91,11 @@ class Gemma4Config(Config):
         self.final_logit_softcapping = self.read_cfg(float, "text_config->final_logit_softcapping", 0.0)
 
         self.hidden_size_per_layer_input = self.read_cfg(int, "text_config->hidden_size_per_layer_input", 0)
-        if self.hidden_size_per_layer_input:
-            raise NotImplementedError("Gemma4 per-layer inputs are not implemented yet")
+        self.vocab_size_per_layer_input = self.read_cfg(
+            int,
+            "text_config->vocab_size_per_layer_input",
+            self.vocab_size,
+        )
 
         self.enable_moe_block = self.read_cfg(bool, "text_config->enable_moe_block", False)
         self.num_experts = self.read_cfg(int, "text_config->num_experts", 0)
@@ -181,15 +187,42 @@ class Gemma4TextModel(Model):
 
         use_moe = config.enable_moe_block
 
-        self.modules += [
-            Embedding(
-                config = config,
-                key = f"{key_prefix}.embed_tokens",
-                vocab_size = config.vocab_size,
-                hidden_size = config.hidden_size,
-                multiplier = torch.tensor(config.hidden_size ** 0.5, dtype = torch.bfloat16).float().item()
+        if config.hidden_size_per_layer_input:
+            self.modules.append(
+                Gemma4TextInputEmbedding(
+                    config = config,
+                    key = key_prefix,
+                    vocab_size = config.vocab_size,
+                    hidden_size = config.hidden_size,
+                    pad_token_id = config.pad_token_id,
+                    num_hidden_layers = config.num_hidden_layers,
+                    hidden_size_per_layer_input = config.hidden_size_per_layer_input,
+                    vocab_size_per_layer_input = config.vocab_size_per_layer_input,
+                    out_dtype = torch.float,
+                )
             )
-        ]
+            self.modules.append(
+                Gemma4PerLayerInputProjector(
+                    config = config,
+                    key = key_prefix,
+                    hidden_size = config.hidden_size,
+                    num_hidden_layers = config.num_hidden_layers,
+                    hidden_size_per_layer_input = config.hidden_size_per_layer_input,
+                    rms_norm_eps = config.rms_norm_eps,
+                    out_dtype = torch.float,
+                    qmap = "block.ple_projection",
+                )
+            )
+        else:
+            self.modules.append(
+                Embedding(
+                    config = config,
+                    key = f"{key_prefix}.embed_tokens",
+                    vocab_size = config.vocab_size,
+                    hidden_size = config.hidden_size,
+                    multiplier = torch.tensor(config.hidden_size ** 0.5, dtype = torch.bfloat16).float().item()
+                )
+            )
 
         self.first_block_idx = len(self.modules)
 
@@ -368,6 +401,20 @@ class Gemma4TextModel(Model):
             )
 
             self.modules.append(block)
+            if config.hidden_size_per_layer_input:
+                self.modules.append(
+                    Gemma4PerLayerInput(
+                        config = config,
+                        key = f"{key_prefix}.layers.{idx}",
+                        layer_idx = idx,
+                        hidden_size = config.hidden_size,
+                        hidden_size_per_layer_input = config.hidden_size_per_layer_input,
+                        rms_norm_eps = config.rms_norm_eps,
+                        out_dtype = torch.float,
+                        gate_qmap = f"block.ple_gate.{idx}",
+                        proj_qmap = f"block.ple_proj.{idx}",
+                    )
+                )
 
         self.last_kv_module_idx = len(self.modules) - 1
 
